@@ -27,7 +27,7 @@ jobs:
     strategy:
       matrix:
         flink: [1.16-SNAPSHOT, 1.17-SNAPSHOT, 1.18-SNAPSHOT]
-    uses: apache/flink-connector-shared-utils/.github/workflows/ci.yml@ci_utils
+    uses: martijnvisser/flink-connector-shared-utils/.github/workflows/ci.yml@FLINK-31923-specify-branches
     with:
       flink_version: ${{ matrix.flink }}
       run_dependency_convergence: false
