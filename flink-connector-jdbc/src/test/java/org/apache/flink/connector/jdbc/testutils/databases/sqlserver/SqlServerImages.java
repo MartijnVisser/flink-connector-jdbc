@@ -26,5 +26,5 @@ public interface SqlServerImages {
                     .asCompatibleSubstituteFor("mcr.microsoft.com/mssql/server");
 
     String MSSQL_SERVER_2017 = "mcr.microsoft.com/mssql/server:2017-CU12";
-    String MSSQL_SERVER_2019 = "mcr.microsoft.com/mssql/server:2019-GA-ubuntu-16.04";
+    String MSSQL_SERVER_2019 = "mcr.microsoft.com/mssql/server:2019-CU14-ubuntu-20.04";
 }
