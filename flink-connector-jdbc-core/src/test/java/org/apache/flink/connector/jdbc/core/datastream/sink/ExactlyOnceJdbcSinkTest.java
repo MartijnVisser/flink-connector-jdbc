@@ -17,6 +17,7 @@
 
 package org.apache.flink.connector.jdbc.core.datastream.sink;
 
+import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -37,13 +38,22 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.util.RestartStrategyUtils;
 import org.apache.flink.testutils.junit.SharedObjectsExtension;
 import org.apache.flink.testutils.junit.SharedReference;
+import org.apache.flink.util.function.SerializableSupplier;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
+import javax.sql.XAConnection;
+import javax.sql.XADataSource;
+import javax.transaction.xa.XAException;
+import javax.transaction.xa.XAResource;
 import javax.transaction.xa.Xid;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -243,6 +253,67 @@ class ExactlyOnceJdbcSinkTest extends BaseJdbcSinkTest {
         }
     }
 
+    /**
+     * In BATCH mode the committer restarts on its own, without a restored checkpoint, and gets all
+     * transactions again, including the one it committed before the failure. Without checkpointing,
+     * AUTOMATIC mode runs a bounded job as BATCH.
+     */
+    @ParameterizedTest
+    @CsvSource({"BATCH, true", "AUTOMATIC, false"})
+    void testCommitterRestartInBatchMode(RuntimeExecutionMode mode, boolean checkpointing)
+            throws Exception {
+        Configuration config = new Configuration();
+        config.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
+        config.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 1);
+        config.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_DELAY, Duration.ZERO);
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(config);
+        env.setRuntimeMode(mode);
+        env.setParallelism(2);
+        if (checkpointing) {
+            env.enableCheckpointing(100L);
+        }
+        SharedReference<AtomicInteger> commits = sharedObjects.add(new AtomicInteger());
+
+        env.fromSequence(0, RECOVERY_RECORDS - 1)
+                .map(ExactlyOnceJdbcSinkTest::book)
+                .returns(BooksTable.BookEntry.class)
+                .sinkTo(
+                        new JdbcSinkBuilder<BooksTable.BookEntry>()
+                                .withQueryStatement(
+                                        RECOVERY_TABLE.getInsertIntoQuery(),
+                                        (ps, book) -> {
+                                            ps.setInt(1, book.id);
+                                            ps.setString(2, book.title);
+                                            ps.setString(3, book.author);
+                                            ps.setDouble(4, book.price);
+                                            ps.setInt(5, book.qty);
+                                        })
+                                .withExecutionOptions(
+                                        JdbcExecutionOptions.builder().withMaxRetries(0).build())
+                                .buildExactlyOnce(
+                                        JdbcExactlyOnceOptions.defaults(),
+                                        new FailingSecondCommitXaSource(
+                                                getMetadata().getXaSourceSupplier(), commits)));
+        env.execute();
+
+        // the first commit and the failing second one, then both again after the restart
+        assertThat(commits.get().get()).isEqualTo(4);
+        try (SimpleXaConnectionProvider xa =
+                SimpleXaConnectionProvider.from(getMetadata().buildXaDataSource())) {
+            xa.open();
+            assertThat(xa.recover()).isEmpty();
+        }
+        List<Integer> written =
+                RECOVERY_TABLE.selectAllTable(getMetadata()).stream()
+                        .map(row -> (Integer) row.getField(0))
+                        .collect(Collectors.toList());
+        assertThat(written)
+                .containsExactlyInAnyOrderElementsOf(
+                        IntStream.range(0, (int) RECOVERY_RECORDS)
+                                .boxed()
+                                .collect(Collectors.toList()));
+    }
+
     private static BooksTable.BookEntry book(Long id) {
         return new BooksTable.BookEntry(id.intValue(), "Book " + id, "Writer", id.doubleValue(), 1);
     }
@@ -297,6 +368,54 @@ class ExactlyOnceJdbcSinkTest extends BaseJdbcSinkTest {
         @Override
         public void initializeState(FunctionInitializationContext context) {
             restored = context.isRestored();
+        }
+    }
+
+    /** Fails the second commit with XAER_RMERR, after the first one went through. */
+    private static class FailingSecondCommitXaSource implements SerializableSupplier<XADataSource> {
+
+        private static final long serialVersionUID = 1L;
+
+        private final SerializableSupplier<XADataSource> xaSource;
+        private final SharedReference<AtomicInteger> commits;
+
+        FailingSecondCommitXaSource(
+                SerializableSupplier<XADataSource> xaSource,
+                SharedReference<AtomicInteger> commits) {
+            this.xaSource = xaSource;
+            this.commits = commits;
+        }
+
+        @Override
+        public XADataSource get() {
+            return intercept(XADataSource.class, xaSource.get());
+        }
+
+        private <T> T intercept(Class<T> type, T target) {
+            return type.cast(
+                    Proxy.newProxyInstance(
+                            getClass().getClassLoader(),
+                            new Class<?>[] {type},
+                            (proxy, method, args) -> {
+                                if (target instanceof XAResource
+                                        && method.getName().equals("commit")
+                                        && commits.get().incrementAndGet() == 2) {
+                                    throw new XAException(XAException.XAER_RMERR);
+                                }
+                                Object result;
+                                try {
+                                    result = method.invoke(target, args);
+                                } catch (InvocationTargetException e) {
+                                    throw e.getCause();
+                                }
+                                if (result instanceof XAConnection) {
+                                    return intercept(XAConnection.class, (XAConnection) result);
+                                }
+                                if (result instanceof XAResource) {
+                                    return intercept(XAResource.class, (XAResource) result);
+                                }
+                                return result;
+                            }));
         }
     }
 }

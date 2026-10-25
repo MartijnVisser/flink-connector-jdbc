@@ -158,7 +158,8 @@ class ExactlyOnceJdbcWriterTest extends BaseJdbcWriterTest {
                         getDeliveryGuarantee(),
                         newXaConnectionProvider(),
                         getExactlyOnceOptions(),
-                        OptionalLong.empty())) {
+                        OptionalLong.empty(),
+                        false)) {
             committer.commit(Collections.singletonList(request));
         }
         assertThat(request.getFailure()).isNull();

@@ -49,12 +49,18 @@ public class JdbcCommitter implements Committer<JdbcCommitable> {
     private final DeliveryGuarantee deliveryGuarantee;
     private final int maxCommitAttempts;
     private final OptionalLong restoredCheckpointId;
+    private final boolean restartedAtEndOfInput;
 
+    /**
+     * @param restartedAtEndOfInput whether the committer commits at the end of input in BATCH mode
+     *     and an earlier attempt of it may have committed some of the transactions
+     */
     public JdbcCommitter(
             DeliveryGuarantee deliveryGuarantee,
             JdbcConnectionProvider connectionProvider,
             JdbcExactlyOnceOptions exactlyOnceOptions,
-            OptionalLong restoredCheckpointId)
+            OptionalLong restoredCheckpointId,
+            boolean restartedAtEndOfInput)
             throws IOException {
 
         if (DeliveryGuarantee.EXACTLY_ONCE == deliveryGuarantee) {
@@ -66,6 +72,7 @@ public class JdbcCommitter implements Committer<JdbcCommitable> {
 
         this.deliveryGuarantee = deliveryGuarantee;
         this.restoredCheckpointId = restoredCheckpointId;
+        this.restartedAtEndOfInput = restartedAtEndOfInput;
     }
 
     @Override
@@ -87,7 +94,7 @@ public class JdbcCommitter implements Committer<JdbcCommitable> {
         for (CommitRequest<JdbcCommitable> request : committables) {
             Xid xid = request.getCommittable().getXid();
             try {
-                xaConnectionProvider.commit(xid, isRestored(xid));
+                xaConnectionProvider.commit(xid, mayBeCommitted(xid));
             } catch (TransientXaException e) {
                 if (request.getNumberOfRetries() + 1 >= maxCommitAttempts) {
                     request.signalFailedWithUnknownReason(e);
@@ -101,9 +108,14 @@ public class JdbcCommitter implements Committer<JdbcCommitable> {
 
     /**
      * A transaction from before the restored checkpoint may have been committed before the failure.
-     * Any other transaction unknown to the database was not committed.
+     * So may any transaction after a restart at the end of input, as the committer then gets all
+     * transactions again. A transaction the database lost looks the same and is skipped too. Any
+     * other transaction unknown to the database was not committed.
      */
-    private boolean isRestored(Xid xid) throws IOException {
+    private boolean mayBeCommitted(Xid xid) throws IOException {
+        if (restartedAtEndOfInput) {
+            return true;
+        }
         if (!restoredCheckpointId.isPresent()) {
             return false;
         }

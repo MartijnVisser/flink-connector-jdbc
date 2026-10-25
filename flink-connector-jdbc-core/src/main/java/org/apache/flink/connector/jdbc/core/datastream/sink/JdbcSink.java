@@ -19,6 +19,7 @@ package org.apache.flink.connector.jdbc.core.datastream.sink;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.api.connector.sink2.CommitterInitContext;
@@ -26,6 +27,7 @@ import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.connector.sink2.SupportsCommitter;
 import org.apache.flink.api.connector.sink2.SupportsWriterState;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
+import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.jdbc.JdbcExactlyOnceOptions;
 import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
@@ -43,6 +45,7 @@ import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.streaming.api.connector.sink2.CommittableMessage;
 import org.apache.flink.streaming.api.connector.sink2.SupportsPreCommitTopology;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.streaming.api.lineage.LineageVertex;
 import org.apache.flink.streaming.api.lineage.LineageVertexProvider;
@@ -70,6 +73,9 @@ public class JdbcSink<IN>
     private final JdbcExecutionOptions executionOptions;
     private final JdbcExactlyOnceOptions exactlyOnceOptions;
     private final JdbcQueryStatement<IN> queryStatement;
+
+    /** Set when the job is translated, see {@link #addPreCommitTopology}. */
+    private boolean commitsAtEndOfInput;
 
     public JdbcSink(
             DeliveryGuarantee deliveryGuarantee,
@@ -102,7 +108,8 @@ public class JdbcSink<IN>
                 deliveryGuarantee,
                 connectionProvider,
                 exactlyOnceOptions,
-                committerInitContext.getRestoredCheckpointId());
+                committerInitContext.getRestoredCheckpointId(),
+                commitsAtEndOfInput && committerInitContext.getTaskInfo().getAttemptNumber() > 0);
     }
 
     @Override
@@ -118,6 +125,17 @@ public class JdbcSink<IN>
         if (deliveryGuarantee != DeliveryGuarantee.EXACTLY_ONCE) {
             return committables;
         }
+        // In BATCH mode the committer commits at the end of input. Flink resolves AUTOMATIC only
+        // later, so a job in AUTOMATIC mode with checkpointing that runs as BATCH isn't detected,
+        // and one without checkpointing that runs as STREAMING is treated as BATCH. A restart
+        // there re-runs the writers, so only a transaction the database lost gets skipped.
+        // getConfiguration() is @Internal, but nothing public has the runtime mode.
+        StreamExecutionEnvironment env = committables.getExecutionEnvironment();
+        RuntimeExecutionMode mode = env.getConfiguration().get(ExecutionOptions.RUNTIME_MODE);
+        commitsAtEndOfInput =
+                mode == RuntimeExecutionMode.BATCH
+                        || (mode == RuntimeExecutionMode.AUTOMATIC
+                                && !env.getCheckpointConfig().isCheckpointingEnabled());
         // A prepared transaction keeps its locks until it is committed, so a writer chained to the
         // committer could block on one and keep the committer from running. The map is chained to
         // the writer, so the writer keeps its generated operator id and savepoints without a uid

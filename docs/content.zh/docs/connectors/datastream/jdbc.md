@@ -471,6 +471,11 @@ A prepared transaction keeps its locks until it is committed, so a record that t
 If several sink subtasks write the same rows, use `keyBy` on the row key. Otherwise they can block each other until the database's lock timeout fails the job.
 The same happens if a checkpoint takes longer than the lock timeout. PostgreSQL waits forever by default, so set `lock_timeout`.
 
+In `BATCH` mode, the committer commits at the end of input. After a restart it gets all transactions again and skips the ones the database doesn't know, as it may have committed them before the failure.
+It can't tell those from transactions the database lost, so it skips them too and logs a warning.
+A job in `AUTOMATIC` mode without checkpointing is treated the same way, also when an unbounded source makes it run as `STREAMING`. A restart there re-runs the writers, so only a transaction the database lost gets skipped.
+The sink can't tell that a job in `AUTOMATIC` mode with checkpointing runs as `BATCH`. A restarted committer then fails on the first transaction it already committed, and the remaining prepared transactions have to be committed by hand. Set `execution.runtime-mode` to `BATCH` for such a job.
+
 **ATTENTION:** Currently, `JdbcSink.exactlyOnceSink` can ensure exactly once semantics
 with `JdbcExecutionOptions.maxRetries == 0`; otherwise, duplicated results maybe produced.
 

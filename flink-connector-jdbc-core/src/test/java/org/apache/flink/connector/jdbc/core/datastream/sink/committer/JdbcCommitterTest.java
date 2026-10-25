@@ -18,8 +18,17 @@
 package org.apache.flink.connector.jdbc.core.datastream.sink.committer;
 
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.JobInfo;
+import org.apache.flink.api.common.JobInfoImpl;
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.TaskInfo;
+import org.apache.flink.api.common.TaskInfoImpl;
+import org.apache.flink.api.connector.sink2.Committer;
+import org.apache.flink.api.connector.sink2.CommitterInitContext;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.jdbc.JdbcExactlyOnceOptions;
+import org.apache.flink.connector.jdbc.core.datastream.sink.JdbcSink;
+import org.apache.flink.connector.jdbc.core.datastream.sink.JdbcSinkBuilder;
 import org.apache.flink.connector.jdbc.datasource.connections.xa.SimpleXaConnectionProvider;
 import org.apache.flink.connector.jdbc.datasource.connections.xa.XaConnectionProvider;
 import org.apache.flink.connector.jdbc.datasource.transactions.xa.domain.TransactionId;
@@ -27,10 +36,17 @@ import org.apache.flink.connector.jdbc.datasource.transactions.xa.exceptions.Tra
 import org.apache.flink.connector.jdbc.derby.DerbyTestBase;
 import org.apache.flink.connector.jdbc.testutils.TableManaged;
 import org.apache.flink.connector.jdbc.testutils.tables.templates.BooksTable;
+import org.apache.flink.metrics.groups.SinkCommitterMetricGroup;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
+import org.apache.flink.runtime.metrics.groups.InternalSinkCommitterMetricGroup;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.util.FlinkRuntimeException;
+import org.apache.flink.util.InstantiationUtil;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import javax.transaction.xa.XAException;
 import javax.transaction.xa.Xid;
@@ -122,6 +138,72 @@ class JdbcCommitterTest implements DerbyTestBase {
         }
     }
 
+    /**
+     * In BATCH mode the committer commits at the end of input. After a restart it gets all
+     * transactions again, including the ones it committed before the failure.
+     */
+    @ParameterizedTest
+    @CsvSource({"BATCH, true", "BATCH, false", "AUTOMATIC, false"})
+    void testCommitAlreadyCommittedTransactionAfterRestartAtEndOfInput(
+            RuntimeExecutionMode mode, boolean checkpointing) throws Exception {
+        prepareTransaction();
+        JdbcSink<BooksTable.BookEntry> sink = translatedSink(mode, checkpointing);
+        JdbcCommitable committable = serializeAndDeserialize();
+
+        commit(sink, 0, new TestingCommitRequest(committable));
+        TestingCommitRequest request = new TestingCommitRequest(committable);
+        commit(sink, 1, request);
+
+        assertThat(request.getFailure()).isNull();
+        assertThat(recover()).doesNotContain(transactionId);
+        assertThat(TEST_TABLE.selectAllTable(getMetadata())).containsExactly(BOOK);
+    }
+
+    /**
+     * A restarted committer at the end of input can't tell a transaction the database lost from one
+     * it committed before, so it skips that one too.
+     */
+    @Test
+    void testSkipLostTransactionAfterRestartAtEndOfInput() throws Exception {
+        JdbcSink<BooksTable.BookEntry> sink = translatedSink(RuntimeExecutionMode.BATCH, false);
+        TestingCommitRequest request = new TestingCommitRequest(serializeAndDeserialize());
+
+        commit(sink, 1, request);
+
+        assertThat(request.getFailure()).isNull();
+        assertThat(TEST_TABLE.selectAllTable(getMetadata())).isEmpty();
+    }
+
+    /** Before its first restart, a committer at the end of input has not committed anything. */
+    @ParameterizedTest
+    @CsvSource({"BATCH, true", "BATCH, false", "AUTOMATIC, false"})
+    void testFailOnUnknownTransactionAtEndOfInput(RuntimeExecutionMode mode, boolean checkpointing)
+            throws Exception {
+        JdbcSink<BooksTable.BookEntry> sink = translatedSink(mode, checkpointing);
+        TestingCommitRequest request = new TestingCommitRequest(serializeAndDeserialize());
+
+        assertThatThrownBy(() -> commit(sink, 0, request))
+                .isInstanceOf(FlinkRuntimeException.class)
+                .hasMessageContaining("Unable to commit");
+    }
+
+    /**
+     * In STREAMING mode a restart also restarts the writers, so a restarted committer without a
+     * restored checkpoint has not committed any of its transactions. A job in AUTOMATIC mode with
+     * checkpointing that runs as BATCH isn't detected and fails the same way.
+     */
+    @ParameterizedTest
+    @CsvSource({"STREAMING, true", "STREAMING, false", "AUTOMATIC, true"})
+    void testFailOnUnknownTransactionAfterRestart(RuntimeExecutionMode mode, boolean checkpointing)
+            throws Exception {
+        JdbcSink<BooksTable.BookEntry> sink = translatedSink(mode, checkpointing);
+        TestingCommitRequest request = new TestingCommitRequest(serializeAndDeserialize());
+
+        assertThatThrownBy(() -> commit(sink, 1, request))
+                .isInstanceOf(FlinkRuntimeException.class)
+                .hasMessageContaining("Unable to commit");
+    }
+
     @Test
     void testRetryTransientFailureUntilMaxCommitAttempts() throws Exception {
         JdbcCommitable committable = JdbcCommitable.of(transactionId);
@@ -182,7 +264,68 @@ class JdbcCommitterTest implements DerbyTestBase {
                 DeliveryGuarantee.EXACTLY_ONCE,
                 connectionProvider,
                 JdbcExactlyOnceOptions.defaults(),
-                restoredCheckpointId);
+                restoredCheckpointId,
+                false);
+    }
+
+    /** Translates a job with the sink and returns the copy of the sink that the committer gets. */
+    private JdbcSink<BooksTable.BookEntry> translatedSink(
+            RuntimeExecutionMode mode, boolean checkpointing) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setRuntimeMode(mode);
+        if (checkpointing) {
+            env.enableCheckpointing(100L);
+        }
+        JdbcSink<BooksTable.BookEntry> sink =
+                new JdbcSinkBuilder<BooksTable.BookEntry>()
+                        .withQueryStatement(
+                                TEST_TABLE.getInsertIntoQuery(), TEST_TABLE.getStatementBuilder())
+                        .buildExactlyOnce(
+                                JdbcExactlyOnceOptions.defaults(),
+                                getMetadata().getXaSourceSupplier());
+        env.fromCollection(Collections.singletonList(BOOK)).sinkTo(sink);
+        env.getStreamGraph();
+        return InstantiationUtil.clone(sink);
+    }
+
+    private static void commit(
+            JdbcSink<BooksTable.BookEntry> sink, int attemptNumber, TestingCommitRequest request)
+            throws Exception {
+        try (Committer<JdbcCommitable> committer =
+                sink.createCommitter(new TestingCommitterInitContext(attemptNumber))) {
+            committer.commit(Collections.singletonList(request));
+        }
+    }
+
+    /** The context of a committer that has no checkpoint to restore. */
+    private static class TestingCommitterInitContext implements CommitterInitContext {
+
+        private final int attemptNumber;
+
+        TestingCommitterInitContext(int attemptNumber) {
+            this.attemptNumber = attemptNumber;
+        }
+
+        @Override
+        public SinkCommitterMetricGroup metricGroup() {
+            return InternalSinkCommitterMetricGroup.wrap(
+                    UnregisteredMetricsGroup.createOperatorMetricGroup());
+        }
+
+        @Override
+        public OptionalLong getRestoredCheckpointId() {
+            return OptionalLong.empty();
+        }
+
+        @Override
+        public JobInfo getJobInfo() {
+            return new JobInfoImpl(new JobID(), "job");
+        }
+
+        @Override
+        public TaskInfo getTaskInfo() {
+            return new TaskInfoImpl("committer", 1, 0, 1, attemptNumber);
+        }
     }
 
     /** Answers every commit with a transient failure. */
