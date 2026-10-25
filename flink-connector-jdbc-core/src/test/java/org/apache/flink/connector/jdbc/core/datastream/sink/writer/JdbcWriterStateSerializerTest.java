@@ -19,13 +19,17 @@ package org.apache.flink.connector.jdbc.core.datastream.sink.writer;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.connector.jdbc.datasource.transactions.xa.domain.TransactionId;
+import org.apache.flink.util.StringUtils;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Smoke test for {@link
@@ -50,5 +54,122 @@ class JdbcWriterStateSerializerTest {
         JdbcWriterState deserialized = tester.deserialize(tester.getVersion(), serialized);
 
         assertThat(deserialized).isEqualTo(original);
+    }
+
+    @Test
+    void testSerDeWithPrefix() throws IOException {
+        TransactionId baseTid = TransactionId.create("orders", new JobID().getBytes(), 1, 2);
+        JdbcWriterState original =
+                JdbcWriterState.of(
+                        Arrays.asList(baseTid.withBranch(1001L)),
+                        Arrays.asList(baseTid.withBranch(2001L)));
+        JdbcWriterStateSerializer tester = new JdbcWriterStateSerializer();
+
+        JdbcWriterState deserialized =
+                tester.deserialize(tester.getVersion(), tester.serialize(original));
+
+        assertThat(deserialized).isEqualTo(original);
+        assertThat(deserialized.getHanging().iterator().next().getPrefix()).hasValue("orders");
+    }
+
+    /** The prefix of an xid is at most 43 bytes, but its length must not shift the stream. */
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 43, 127, 128, 255, 256})
+    void testSerDeWithPrefixOfLength(int length) throws IOException {
+        byte[] prefix = new byte[length];
+        Arrays.fill(prefix, (byte) 'a');
+        TransactionId baseTid =
+                TransactionId.create(new JobID().getBytes(), 1, 2).withPrefix(prefix);
+        JdbcWriterState original =
+                JdbcWriterState.of(
+                        Arrays.asList(baseTid.withBranch(1001L)),
+                        Arrays.asList(baseTid.withBranch(2001L), baseTid.withBranch(2002L)));
+        JdbcWriterStateSerializer tester = new JdbcWriterStateSerializer();
+
+        JdbcWriterState deserialized =
+                tester.deserialize(tester.getVersion(), tester.serialize(original));
+
+        assertThat(deserialized).isEqualTo(original);
+        assertThat(deserialized.getHanging())
+                .allSatisfy(tid -> assertThat(tid.getPrefixBytes()).isEqualTo(prefix));
+    }
+
+    /** Corrupt state fails as such, not with whatever a wrong size or length leads to. */
+    @ParameterizedTest
+    @ValueSource(
+            strings = {
+                // negative number of transaction ids
+                "ffffffff00000000",
+                // more transaction ids than bytes
+                "7fffffff00000000",
+                // negative prefix length other than none
+                "0000000100fffffffe00000000",
+                // longer prefix than bytes
+                "000000010000000fff00000000"
+            })
+    void testDeserializeCorruptState(String hex) {
+        JdbcWriterStateSerializer tester = new JdbcWriterStateSerializer();
+
+        assertThatThrownBy(
+                        () ->
+                                tester.deserialize(
+                                        tester.getVersion(), StringUtils.hexStringToByte(hex)))
+                .isInstanceOf(IOException.class);
+    }
+
+    /** Pins the layout of version 3, so that a change to it can't go unnoticed. */
+    @Test
+    void testVersion3Layout() throws IOException {
+        TransactionId baseTid =
+                TransactionId.create(
+                        "orders",
+                        JobID.fromHexString("6b64d8a9a951e2e8767ae952ad951706").getBytes(),
+                        1,
+                        2);
+        JdbcWriterState state =
+                JdbcWriterState.of(
+                        Arrays.asList(baseTid.withBranch(1001L)),
+                        Arrays.asList(baseTid.withBranch(2001L)));
+        byte[] version3 =
+                StringUtils.hexStringToByte(
+                        "00000001446b64d8a9a951e2e8767ae952ad951706000000010000000200000000000007"
+                                + "d10000000000000000000000000000000000000000000000000000000000000000000000"
+                                + "00000000066f726465727300000001446b64d8a9a951e2e8767ae952ad95170600000001000000"
+                                + "0200000000000003e9000000000000000000000000000000000000000000000000000000"
+                                + "000000000000000000000000066f7264657273");
+        JdbcWriterStateSerializer serializer = new JdbcWriterStateSerializer();
+
+        assertThat(serializer.getVersion()).isEqualTo(3);
+        assertThat(serializer.serialize(state)).isEqualTo(version3);
+        assertThat(serializer.deserialize(3, version3)).isEqualTo(state);
+    }
+
+    /**
+     * Version 2 is the state of 4.1.0, here written by its writer after the commit for checkpoint
+     * 1000 failed transiently.
+     */
+    @Test
+    void testDeserializeVersion2() throws IOException {
+        TransactionId baseTid =
+                TransactionId.create(
+                        JobID.fromHexString("6b64d8a9a951e2e8767ae952ad951706").getBytes(), 1, 2);
+        byte[] version2 =
+                StringUtils.hexStringToByte(
+                        "00000001446b64d8a9a951e2e8767ae952ad951706000000010000000200000000000003"
+                                + "e90000000000000000000000000000000000000000000000000000000000000000000000"
+                                + "0000000001446b64d8a9a951e2e8767ae952ad9517060000000100000002000000000000"
+                                + "03e800000001000000000000000000000000000000000000000000000000000000000000"
+                                + "0000");
+
+        JdbcWriterState deserialized = new JdbcWriterStateSerializer().deserialize(2, version2);
+
+        assertThat(deserialized)
+                .isEqualTo(
+                        JdbcWriterState.of(
+                                Arrays.asList(baseTid.withBranch(1000L)),
+                                Arrays.asList(baseTid.withBranch(1001L))));
+        assertThat(deserialized.getPrepared().iterator().next().getAttempts()).isEqualTo(1);
+        assertThat(deserialized.getHanging().iterator().next().getGlobalTransactionId())
+                .isEqualTo(baseTid.getGlobalTransactionId());
     }
 }
