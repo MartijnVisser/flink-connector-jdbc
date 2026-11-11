@@ -463,9 +463,24 @@ If several sink subtasks write the same rows, use `keyBy` on the row key. Otherw
 The same happens if a checkpoint takes longer than the lock timeout. PostgreSQL waits forever by default, so set `lock_timeout`.
 
 A restarted job rolls back the transactions that its failed attempt prepared for checkpoints that never completed.
-After a restart at another parallelism, the transactions of checkpoints after the restored one keep their locks until they are rolled back by hand. So do those that an earlier job left behind, for example when a savepoint is restored into a new job.
+To also roll back those that an earlier job left behind, give the sink a transaction id prefix. That covers a savepoint or a retained checkpoint restored into a new job, and a restart at another parallelism.
+
+```java
+JdbcExactlyOnceOptions.builder()
+    .withTransactionIdPrefix("books-sink")
+    .build();
+```
+
+Keep the prefix the same across restarts, and don't use it for another sink or job that writes to the same database at the same time. A starting sink rolls back the prepared transactions of the others under its prefix.
+So a job restored from the savepoint of a job that still runs, as in a blue/green deployment, needs a prefix of its own.
+The sink tells jobs apart by their job id. Jobs that run at the same time with the same job id, for example because it is pinned or derived from the same high-availability cluster id, need a different prefix each.
+The prefix is at most 43 bytes in UTF-8.
+A job that gets a prefix and keeps its job id and parallelism, for example after a last-state upgrade, still rolls back what it left behind without one. So it must not run at the same time as a job without a prefix that has the same job id.
+
+Without a prefix, the leftovers of an earlier job keep their locks until they are rolled back by hand. So do those of checkpoints after the restored one when the job restarts at another parallelism. With a prefix, so do those that an earlier job left behind without one.
 On PostgreSQL, list them with `SELECT gid FROM pg_prepared_xacts` and roll them back with `ROLLBACK PREPARED '<gid>'`. On MySQL, use `XA RECOVER CONVERT XID` and `XA ROLLBACK`.
-The global transaction id starts with the job id (16 bytes) and the subtask index (4 bytes). The branch qualifier starts with the sink parallelism (4 bytes) and the id of the last checkpoint before the transaction started (8 bytes). PostgreSQL shows both in base64 in the gid, after the format id and separated by `_`, and MySQL shows them in hex.
+The global transaction id starts with the job id (16 bytes) and the subtask index (4 bytes). The branch qualifier starts with the sink parallelism (4 bytes) and the id of the last checkpoint before the transaction started (8 bytes). With a prefix, the format id is 203 and the global transaction id starts with the length of the prefix (1 byte) and the prefix, followed by the job id and the subtask index.
+PostgreSQL shows the global transaction id and the branch qualifier in base64 in the gid, after the format id and separated by `_`, and MySQL shows them in hex.
 Only roll back those with the restored checkpoint id or a higher one: the committer commits the others after the restore, and skips any that are gone. Never roll back those with the job id of a job that runs and the parallelism of one of its exactly-once sinks.
 
 **ATTENTION:** The exactly-once sink requires `JdbcExecutionOptions.maxRetries` to be set to `0`.
