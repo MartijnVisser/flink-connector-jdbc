@@ -23,6 +23,7 @@ import org.apache.flink.connector.jdbc.core.datastream.sink.writer.JdbcWriterSta
 import org.apache.flink.connector.jdbc.datasource.connections.xa.SimpleXaConnectionProvider;
 import org.apache.flink.connector.jdbc.datasource.connections.xa.XaConnectionProvider;
 import org.apache.flink.connector.jdbc.datasource.transactions.xa.domain.TransactionId;
+import org.apache.flink.connector.jdbc.datasource.transactions.xa.exceptions.TransientXaException;
 import org.apache.flink.connector.jdbc.testutils.DatabaseTest;
 import org.apache.flink.connector.jdbc.testutils.TableManaged;
 import org.apache.flink.connector.jdbc.testutils.tables.templates.BooksTable;
@@ -31,22 +32,37 @@ import org.apache.flink.util.FlinkRuntimeException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import javax.sql.XAConnection;
+import javax.sql.XADataSource;
+import javax.transaction.xa.XAException;
+import javax.transaction.xa.XAResource;
 import javax.transaction.xa.Xid;
 
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.PreparedStatement;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assumptions.assumeThat;
 
 /** Tests for {@link XaTransaction} against a database with two-phase commit. */
 public abstract class XaTransactionTest implements DatabaseTest {
 
     private static final BooksTable TEST_TABLE = new BooksTable("XaTransactionTable");
+
+    /**
+     * A data source of a user that can't roll back the transactions of the test user, or null if
+     * the database has none.
+     */
+    protected XADataSource xaDataSourceOfAnotherUser() throws Exception {
+        return null;
+    }
 
     @Override
     public List<TableManaged> getManagedTables() {
@@ -116,11 +132,159 @@ public abstract class XaTransactionTest implements DatabaseTest {
         assertThat(isPrepared(otherSubtask)).isTrue();
     }
 
+    /**
+     * A job restored from a savepoint while the job that took it still runs would roll back the
+     * transaction that job's committer is about to commit.
+     */
+    @Test
+    void testOpenKeepsRestoredHangingOfEarlierJob() throws Exception {
+        byte[] earlierJobId = new JobID().getBytes();
+        TransactionId hanging = prepare(earlierJobId, 0, 1, 5, 1);
+
+        rollbackPreparedTxs(new JobID().getBytes(), 0, 1, 5, restoredState(hanging));
+
+        assertThat(isPrepared(hanging)).isTrue();
+    }
+
+    /** The state of a failed attempt of the same job, here before an upscale. */
+    @Test
+    void testOpenRollsBackRestoredHangingOfSameJob() throws Exception {
+        byte[] jobId = new JobID().getBytes();
+        TransactionId hanging = prepare(jobId, 0, 1, 5, 1);
+
+        rollbackPreparedTxs(jobId, 0, 2, 5, restoredState(hanging));
+
+        assertThat(isPrepared(hanging)).isFalse();
+    }
+
+    /**
+     * At another parallelism nothing else rolls back the restored transaction, so a writer that
+     * can't roll it back fails, and the restart tries again.
+     */
+    @Test
+    void testOpenFailsIfRollbackOfRestoredHangingFailsTransiently() throws Exception {
+        byte[] jobId = new JobID().getBytes();
+        TransactionId hanging = prepare(jobId, 0, 1, 5, 1);
+
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create(jobId, 0, 2),
+                        SimpleXaConnectionProvider.from(
+                                failingFirstRollback(
+                                        getMetadata().buildXaDataSource(), XAException.XAER_RMFAIL),
+                                null))) {
+            assertThatThrownBy(() -> transaction.open(restoredState(hanging)))
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasCauseInstanceOf(TransientXaException.class);
+        }
+        assertThat(isPrepared(hanging)).isTrue();
+
+        rollbackPreparedTxs(jobId, 0, 2, 5, restoredState(hanging));
+        assertThat(isPrepared(hanging)).isFalse();
+    }
+
+    /** A failure that a retry on the same connection doesn't fix also fails the writer. */
+    @Test
+    void testOpenFailsIfRollbackOfRestoredHangingFails() throws Exception {
+        byte[] jobId = new JobID().getBytes();
+        TransactionId hanging = prepare(jobId, 0, 1, 5, 1);
+
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create(jobId, 0, 2),
+                        SimpleXaConnectionProvider.from(
+                                failingFirstRollback(
+                                        getMetadata().buildXaDataSource(), XAException.XAER_RMERR),
+                                null))) {
+            assertThatThrownBy(() -> transaction.open(restoredState(hanging)))
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasMessageContaining("failed to roll back 1 transactions out of 1");
+        }
+        assertThat(isPrepared(hanging)).isTrue();
+
+        rollbackPreparedTxs(jobId, 0, 2, 5, restoredState(hanging));
+        assertThat(isPrepared(hanging)).isFalse();
+    }
+
+    /**
+     * A database that refuses the rollback, here to another user than the one that prepared the
+     * transaction.
+     */
+    @Test
+    void testOpenFailsIfRollbackOfRestoredHangingIsRefused() throws Exception {
+        XADataSource anotherUser = xaDataSourceOfAnotherUser();
+        assumeThat(anotherUser).isNotNull();
+        byte[] jobId = new JobID().getBytes();
+        TransactionId hanging = prepare(jobId, 0, 1, 5, 1);
+
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create(jobId, 0, 2),
+                        SimpleXaConnectionProvider.from(anotherUser, null))) {
+            assertThatThrownBy(() -> transaction.open(restoredState(hanging)))
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasMessageContaining("failed to roll back 1 transactions out of 1");
+        }
+        assertThat(isPrepared(hanging)).isTrue();
+    }
+
+    /**
+     * The database reports a heuristic outcome on every rollback until the transaction is
+     * forgotten, so the writer that fails on it forgets it first, and the restart goes on.
+     */
+    @Test
+    void testOpenFailsOnceIfRestoredHangingCompletedHeuristically() throws Exception {
+        byte[] jobId = new JobID().getBytes();
+        TransactionId hanging = prepare(jobId, 0, 1, 5, 1);
+        XADataSource dataSource = heuristicallyCompleted(getMetadata().buildXaDataSource());
+
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create(jobId, 0, 2),
+                        SimpleXaConnectionProvider.from(dataSource, null))) {
+            assertThatThrownBy(() -> transaction.open(restoredState(hanging)))
+                    .isInstanceOf(FlinkRuntimeException.class);
+        }
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create(jobId, 0, 2),
+                        SimpleXaConnectionProvider.from(dataSource, null))) {
+            transaction.open(restoredState(hanging));
+        }
+        assertThat(isPrepared(hanging)).isFalse();
+    }
+
+    /**
+     * At another parallelism the writer only rolls back the transaction that the restored state
+     * names, not those that the failed attempt prepared for later checkpoints.
+     */
+    @Test
+    void testOpenAtOtherParallelismKeepsLaterLeftovers() throws Exception {
+        byte[] jobId = new JobID().getBytes();
+        TransactionId hanging = prepare(jobId, 0, 1, 5, 1);
+        TransactionId later = prepare(jobId, 0, 1, 6, 2);
+
+        rollbackPreparedTxs(jobId, 0, 2, 5, restoredState(hanging));
+
+        assertThat(isPrepared(hanging)).isFalse();
+        assertThat(isPrepared(later)).isTrue();
+    }
+
+    private static JdbcWriterState restoredState(TransactionId hanging) {
+        return JdbcWriterState.of(Collections.emptyList(), Collections.singletonList(hanging));
+    }
+
     /** Prepares a transaction with one record. */
     private TransactionId prepare(
             byte[] jobId, int subtask, int parallelism, long checkpointId, int id)
             throws Exception {
-        try (XaTransaction transaction = newTransaction(jobId, subtask, parallelism)) {
+        try (XaTransaction transaction =
+                newTransaction(jobId, subtask, parallelism, JdbcWriterState.empty())) {
             transaction.createTx(checkpointId);
             try (PreparedStatement ps =
                     transaction
@@ -138,19 +302,25 @@ public abstract class XaTransactionTest implements DatabaseTest {
 
     private void rollbackPreparedTxs(byte[] jobId, int subtask, int parallelism, long checkpointId)
             throws Exception {
-        try (XaTransaction transaction = newTransaction(jobId, subtask, parallelism)) {
+        rollbackPreparedTxs(jobId, subtask, parallelism, checkpointId, JdbcWriterState.empty());
+    }
+
+    private void rollbackPreparedTxs(
+            byte[] jobId, int subtask, int parallelism, long checkpointId, JdbcWriterState state)
+            throws Exception {
+        try (XaTransaction transaction = newTransaction(jobId, subtask, parallelism, state)) {
             transaction.rollbackPreparedTxs(checkpointId);
         }
     }
 
-    private XaTransaction newTransaction(byte[] jobId, int subtask, int parallelism)
-            throws Exception {
+    private XaTransaction newTransaction(
+            byte[] jobId, int subtask, int parallelism, JdbcWriterState state) throws Exception {
         XaTransaction transaction =
                 new XaTransaction(
                         JdbcExactlyOnceOptions.defaults(),
                         TransactionId.create(jobId, subtask, parallelism),
                         newXaConnectionProvider());
-        transaction.open(JdbcWriterState.empty());
+        transaction.open(state);
         return transaction;
     }
 
@@ -174,19 +344,104 @@ public abstract class XaTransactionTest implements DatabaseTest {
     }
 
     private static XaConnectionProvider failingRecover(SimpleXaConnectionProvider delegate) {
-        return (XaConnectionProvider)
+        return proxy(
+                XaConnectionProvider.class,
+                (method, args) -> {
+                    if (method.getName().equals("recover")) {
+                        throw new FlinkRuntimeException("XAER_RMERR");
+                    }
+                    return invoke(delegate, method, args);
+                });
+    }
+
+    /** Fails the first rollback with the given code. */
+    private static XADataSource failingFirstRollback(XADataSource dataSource, int errorCode) {
+        AtomicBoolean failed = new AtomicBoolean();
+        return withResource(
+                dataSource,
+                (resource, method, args) -> {
+                    if (method.getName().equals("rollback") && failed.compareAndSet(false, true)) {
+                        throw new XAException(errorCode);
+                    }
+                    return invoke(resource, method, args);
+                });
+    }
+
+    /**
+     * Rolls the transaction back on the first rollback and then reports {@link
+     * XAException#XA_HEURMIX} until it is forgotten, as a database does for a transaction that was
+     * completed heuristically.
+     */
+    private static XADataSource heuristicallyCompleted(XADataSource dataSource) {
+        AtomicBoolean completed = new AtomicBoolean();
+        AtomicBoolean forgotten = new AtomicBoolean();
+        return withResource(
+                dataSource,
+                (resource, method, args) -> {
+                    if (method.getName().equals("forget")) {
+                        forgotten.set(true);
+                        return null;
+                    }
+                    if (method.getName().equals("rollback") && !forgotten.get()) {
+                        if (completed.compareAndSet(false, true)) {
+                            invoke(resource, method, args);
+                        }
+                        throw new XAException(XAException.XA_HEURMIX);
+                    }
+                    return invoke(resource, method, args);
+                });
+    }
+
+    private interface ResourceHandler {
+        Object handle(XAResource resource, Method method, Object[] args) throws Throwable;
+    }
+
+    /** Passes the calls on every {@link XAResource} that the data source opens to the handler. */
+    private static XADataSource withResource(XADataSource dataSource, ResourceHandler handler) {
+        return proxy(
+                XADataSource.class,
+                (method, args) -> {
+                    Object result = invoke(dataSource, method, args);
+                    if (!method.getName().equals("getXAConnection")) {
+                        return result;
+                    }
+                    XAConnection connection = (XAConnection) result;
+                    return proxy(
+                            XAConnection.class,
+                            (connectionMethod, connectionArgs) -> {
+                                Object resource =
+                                        invoke(connection, connectionMethod, connectionArgs);
+                                if (!connectionMethod.getName().equals("getXAResource")) {
+                                    return resource;
+                                }
+                                return proxy(
+                                        XAResource.class,
+                                        (resourceMethod, resourceArgs) ->
+                                                handler.handle(
+                                                        (XAResource) resource,
+                                                        resourceMethod,
+                                                        resourceArgs));
+                            });
+                });
+    }
+
+    private interface Handler {
+        Object handle(Method method, Object[] args) throws Throwable;
+    }
+
+    private static <T> T proxy(Class<T> type, Handler handler) {
+        return type.cast(
                 Proxy.newProxyInstance(
                         XaTransactionTest.class.getClassLoader(),
-                        new Class<?>[] {XaConnectionProvider.class},
-                        (proxy, method, args) -> {
-                            if (method.getName().equals("recover")) {
-                                throw new FlinkRuntimeException("XAER_RMERR");
-                            }
-                            try {
-                                return method.invoke(delegate, args);
-                            } catch (InvocationTargetException e) {
-                                throw e.getCause();
-                            }
-                        });
+                        new Class<?>[] {type},
+                        (proxy, method, args) -> handler.handle(method, args)));
+    }
+
+    private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
     }
 }

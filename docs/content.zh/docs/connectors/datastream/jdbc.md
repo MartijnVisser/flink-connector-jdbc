@@ -463,6 +463,7 @@ If several sink subtasks write the same rows, use `keyBy` on the row key. Otherw
 The same happens if a checkpoint takes longer than the lock timeout. PostgreSQL waits forever by default, so set `lock_timeout`.
 
 A restarted job rolls back the transactions that its failed attempt prepared for checkpoints that never completed.
+If the database refuses one of these rollbacks, for example because another user prepared the transaction, the restart fails until the transaction is rolled back by hand.
 After a restart at another parallelism, the transactions of checkpoints after the restored one keep their locks until they are rolled back by hand. So do those that an earlier job left behind, for example when a savepoint is restored into a new job.
 On PostgreSQL, list them with `SELECT gid FROM pg_prepared_xacts` and roll them back with `ROLLBACK PREPARED '<gid>'`. On MySQL, use `XA RECOVER CONVERT XID` and `XA ROLLBACK`.
 The global transaction id starts with the job id (16 bytes) and the subtask index (4 bytes). The branch qualifier starts with the sink parallelism (4 bytes) and the id of the last checkpoint before the transaction started (8 bytes). PostgreSQL shows both in base64 in the gid, after the format id and separated by `_`, and MySQL shows them in hex.

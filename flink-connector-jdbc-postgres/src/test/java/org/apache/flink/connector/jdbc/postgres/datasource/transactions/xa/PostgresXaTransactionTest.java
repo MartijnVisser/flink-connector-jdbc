@@ -20,5 +20,29 @@ package org.apache.flink.connector.jdbc.postgres.datasource.transactions.xa;
 import org.apache.flink.connector.jdbc.datasource.transactions.xa.XaTransactionTest;
 import org.apache.flink.connector.jdbc.postgres.PostgresTestBase;
 
+import org.postgresql.xa.PGXADataSource;
+
+import javax.sql.XADataSource;
+
+import java.sql.Connection;
+import java.sql.Statement;
+
 /** The {@link XaTransactionTest} for PostgreSQL. */
-class PostgresXaTransactionTest extends XaTransactionTest implements PostgresTestBase {}
+class PostgresXaTransactionTest extends XaTransactionTest implements PostgresTestBase {
+
+    /** Only the user that prepared a transaction, or a superuser, can roll it back. */
+    @Override
+    protected XADataSource xaDataSourceOfAnotherUser() throws Exception {
+        try (Connection connection = getMetadata().getConnection();
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'another')"
+                            + " THEN CREATE ROLE another LOGIN PASSWORD 'another'; END IF; END $$");
+        }
+        PGXADataSource dataSource = new PGXADataSource();
+        dataSource.setUrl(getMetadata().getJdbcUrl());
+        dataSource.setUser("another");
+        dataSource.setPassword("another");
+        return dataSource;
+    }
+}
