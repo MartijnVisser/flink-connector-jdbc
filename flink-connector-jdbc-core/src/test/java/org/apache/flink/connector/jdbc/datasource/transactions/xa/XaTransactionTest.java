@@ -338,6 +338,35 @@ public abstract class XaTransactionTest implements DatabaseTest {
     }
 
     /**
+     * A restored transaction that fails to commit keeps its locks and nothing retries it before the
+     * next restore, so the writer fails and the restart commits it.
+     */
+    @Test
+    void testOpenFailsIfCommitOfPreparedOfVersion2StateFailsTransiently() throws Exception {
+        TransactionId prepared = prepare(VERSION_2_JOB_ID.getBytes(), 1, 2, 1000, 1);
+        byte[] jobId = new JobID().getBytes();
+
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create(jobId, 1, 2),
+                        SimpleXaConnectionProvider.from(
+                                failingFirstCommit(
+                                        getMetadata().buildXaDataSource(), XAException.XAER_RMFAIL),
+                                null))) {
+            assertThatThrownBy(() -> transaction.open(version2State(VERSION_2_STATE)))
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasCauseInstanceOf(TransientXaException.class);
+        }
+        assertThat(isPrepared(prepared)).isTrue();
+
+        try (XaTransaction ignored = newTransaction(jobId, 1, 2, version2State(VERSION_2_STATE))) {
+            assertThat(isPrepared(prepared)).isFalse();
+        }
+        assertThat(TEST_TABLE.selectAllTable(getMetadata())).hasSize(1);
+    }
+
+    /**
      * The writer of 4.1 may have committed the transaction on a retry before the job failed, so the
      * database no longer knows it.
      */
@@ -439,6 +468,19 @@ public abstract class XaTransactionTest implements DatabaseTest {
                 dataSource,
                 (resource, method, args) -> {
                     if (method.getName().equals("rollback") && failed.compareAndSet(false, true)) {
+                        throw new XAException(errorCode);
+                    }
+                    return invoke(resource, method, args);
+                });
+    }
+
+    /** Fails the first commit with the given code. */
+    private static XADataSource failingFirstCommit(XADataSource dataSource, int errorCode) {
+        AtomicBoolean failed = new AtomicBoolean();
+        return withResource(
+                dataSource,
+                (resource, method, args) -> {
+                    if (method.getName().equals("commit") && failed.compareAndSet(false, true)) {
                         throw new XAException(errorCode);
                     }
                     return invoke(resource, method, args);

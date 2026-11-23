@@ -53,7 +53,7 @@ public class XaTransaction implements Serializable, AutoCloseable {
     private final XaConnectionProvider xaConnectionProvider;
     private final JdbcExactlyOnceOptions exactlyOnceOptions;
 
-    // prepared xids from the restored writer state, committed on open
+    // prepared xids from a restored writer state of 4.1, committed on open
     private transient List<TransactionId> preparedXids = new ArrayList<>();
     // hanging XIDs - used for cleanup
     // it's a list to support retries and scaling down
@@ -96,7 +96,7 @@ public class XaTransaction implements Serializable, AutoCloseable {
                         rolledBack.getTransientFailure().get());
             }
             hangingXids = new LinkedList<>();
-            commitTx();
+            commitPreparedXids();
             if (exactlyOnceOptions.isDiscoverAndRollbackOnRecovery()) {
                 // Pending transactions which are not included into the checkpoint might hold locks
                 // and should be rolled back. However, rolling back ALL transactions can cause data
@@ -253,25 +253,31 @@ public class XaTransaction implements Serializable, AutoCloseable {
         return Optional.ofNullable(prepared);
     }
 
-    public void commitTx() {
-        List<TransactionId> toCommit = preparedXids;
+    /**
+     * Commits the prepared transactions of a restored writer state of 4.1, whose writer committed
+     * at the barrier. They belong to completed checkpoints. One that fails to commit keeps its
+     * locks, and nothing retries it before the next restore, so the writer fails instead.
+     */
+    private void commitPreparedXids() {
+        XaTransactionResult<TransactionId> committed =
+                commit(
+                        new ArrayList<>(preparedXids),
+                        exactlyOnceOptions.isAllowOutOfOrderCommits());
+        committed.throwIfAnyFailed("commit");
+        if (committed.getTransientFailure().isPresent()) {
+            throw new FlinkRuntimeException(
+                    String.format(
+                            "unable to commit the transactions of the restored state: %s",
+                            committed.getForRetry()),
+                    committed.getTransientFailure().get());
+        }
         preparedXids = new ArrayList<>();
-        preparedXids.addAll(commitXids(toCommit));
-    }
-
-    public List<TransactionId> commitXids(List<TransactionId> xids) {
-        return commit(
-                        xids,
-                        exactlyOnceOptions.isAllowOutOfOrderCommits(),
-                        exactlyOnceOptions.getMaxCommitAttempts())
-                .getForRetry();
     }
 
     private XaTransactionResult<TransactionId> commit(
-            List<TransactionId> xids, boolean allowOutOfOrderCommits, int maxCommitAttempts) {
+            List<TransactionId> xids, boolean allowOutOfOrderCommits) {
         XaTransactionResult<TransactionId> result = new XaTransactionResult<>();
-        int origSize = xids.size();
-        LOG.debug("commit {} transactions", origSize);
+        LOG.debug("commit {} transactions", xids.size());
         for (Iterator<TransactionId> i = xids.iterator();
                 i.hasNext() && (result.hasNoFailures() || allowOutOfOrderCommits); ) {
             TransactionId x = i.next();
@@ -280,22 +286,12 @@ public class XaTransaction implements Serializable, AutoCloseable {
                 xaConnectionProvider.commit(x, x.getRestored());
                 result.succeeded(x);
             } catch (TransientXaException e) {
-                result.failedTransiently(x.withAttemptsIncremented(), e);
+                result.failedTransiently(x, e);
             } catch (Exception e) {
                 result.failed(x, e);
             }
         }
         result.getForRetry().addAll(xids);
-        result.throwIfAnyFailed("commit");
-        throwIfAnyReachedMaxAttempts(result, maxCommitAttempts);
-        result.getTransientFailure()
-                .ifPresent(
-                        f ->
-                                LOG.warn(
-                                        "failed to commit {} transactions out of {} (keep them to retry later)",
-                                        result.getForRetry().size(),
-                                        origSize,
-                                        f));
         return result;
     }
 
@@ -339,25 +335,6 @@ public class XaTransaction implements Serializable, AutoCloseable {
                     LOG.info("unable to rollback recovered transaction, xid={}", xid, e);
                 }
             }
-        }
-    }
-
-    private void throwIfAnyReachedMaxAttempts(
-            XaTransactionResult<TransactionId> result, int maxAttempts) {
-        List<TransactionId> reached = null;
-        for (TransactionId x : result.getForRetry()) {
-            if (x.getAttempts() >= maxAttempts) {
-                if (reached == null) {
-                    reached = new ArrayList<>();
-                }
-                reached.add(x);
-            }
-        }
-        if (reached != null) {
-            throw new RuntimeException(
-                    String.format(
-                            "reached max number of commit attempts (%d) for transactions: %s",
-                            maxAttempts, reached));
         }
     }
 }
