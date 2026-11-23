@@ -360,6 +360,45 @@ public abstract class XaTransactionTest implements DatabaseTest {
         assertThat(isPrepared(none)).isTrue();
     }
 
+    /**
+     * Without listing, the writer still rolls back the hanging transaction that its restored state
+     * names, and then fails.
+     */
+    @Test
+    void testRollbackRestoredHangingWithoutRecover() throws Exception {
+        byte[] jobId = new JobID().getBytes();
+        TransactionId hanging = prepare(jobId, 1, 4, 5, 1);
+
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create(jobId, 0, 2),
+                        failingRecover(newXaConnectionProvider()))) {
+            transaction.open(restoredState(hanging));
+            assertThatThrownBy(() -> transaction.rollbackPreparedTxs(5))
+                    .isInstanceOf(FlinkRuntimeException.class);
+        }
+
+        assertThat(isPrepared(hanging)).isFalse();
+    }
+
+    @Test
+    void testRollbackRestoredHangingWithPrefixWithoutRecover() throws Exception {
+        TransactionId hanging = prepare("books", new JobID().getBytes(), 0, 1, 5, 1);
+
+        try (XaTransaction transaction =
+                new XaTransaction(
+                        JdbcExactlyOnceOptions.defaults(),
+                        TransactionId.create("books", new JobID().getBytes(), 0, 1),
+                        failingRecover(newXaConnectionProvider()))) {
+            transaction.open(restoredState(hanging));
+            assertThatThrownBy(() -> transaction.rollbackPreparedTxs(5))
+                    .isInstanceOf(FlinkRuntimeException.class);
+        }
+
+        assertThat(isPrepared(hanging)).isFalse();
+    }
+
     /** A transaction that is gone by the time the writer rolls it back is no failure. */
     @Test
     void testRollbackPreparedTxsOfTransactionRolledBackMeanwhile() throws Exception {

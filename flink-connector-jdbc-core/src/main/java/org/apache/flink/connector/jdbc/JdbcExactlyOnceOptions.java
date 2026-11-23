@@ -39,20 +39,11 @@ import java.util.Optional;
  * <p><b>allowOutOfOrderCommits</b> - deprecated; see {@link
  * JDBCExactlyOnceOptionsBuilder#withAllowOutOfOrderCommits(boolean)}. Default: false.
  *
- * <p><b>recoveredAndRollback</b> - whether to rollback prepared transactions known to XA RM on
- * startup (after committing <b>known</b> transactions, i.e. restored from state). Transactions of
- * checkpoints before the restored one belong to the committer.
- *
- * <p>NOTE that setting this parameter to true may:
- *
- * <ol>
- *   <li>interfere with other subtasks or applications (one subtask rolling back transactions
- *       prepared by the other one (and known to it))
- *   <li>block when using with some non-MVCC databases, if there are ended-not-prepared transactions
- * </ol>
- *
  * <p><b>transactionIdPrefix</b> - the prefix of the XA transaction ids of this sink; see {@link
  * JDBCExactlyOnceOptionsBuilder#withTransactionIdPrefix(String)}. Not set by default.
+ *
+ * <p><b>recoveredAndRollback</b> - deprecated, has no effect and can be dropped; see {@link
+ * JDBCExactlyOnceOptionsBuilder#withRecoveredAndRollback(boolean)}.
  */
 @PublicEvolving
 public class JdbcExactlyOnceOptions implements Serializable {
@@ -89,6 +80,11 @@ public class JdbcExactlyOnceOptions implements Serializable {
         return builder().build();
     }
 
+    /**
+     * @deprecated Has no effect, see {@link
+     *     JDBCExactlyOnceOptionsBuilder#withRecoveredAndRollback}.
+     */
+    @Deprecated
     public boolean isDiscoverAndRollbackOnRecovery() {
         return discoverAndRollbackOnRecovery;
     }
@@ -133,10 +129,15 @@ public class JdbcExactlyOnceOptions implements Serializable {
         @Nullable private String transactionIdPrefix;
 
         /**
-         * Toggle discovery and rollback of prepared transactions upon recovery to prevent new
-         * transactions from being blocked by the older ones. Each subtask rollbacks its own
-         * transaction. This flag must be disabled when rescaling to prevent data loss.
+         * Was meant to toggle the rollback of prepared transactions on recovery.
+         *
+         * @deprecated Has no effect, so drop the call, also where it was set to false for a rescale
+         *     as earlier versions asked. A restarted writer always rolls back the prepared
+         *     transactions that it left behind, and fails if it can't list them; set {@link
+         *     #withTransactionIdPrefix(String)} to also roll back those of earlier jobs and of
+         *     another parallelism.
          */
+        @Deprecated
         public JDBCExactlyOnceOptionsBuilder withRecoveredAndRollback(
                 boolean recoveredAndRollback) {
             this.recoveredAndRollback = recoveredAndRollback;
