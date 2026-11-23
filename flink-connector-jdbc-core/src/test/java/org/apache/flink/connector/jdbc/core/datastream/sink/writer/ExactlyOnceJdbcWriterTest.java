@@ -28,12 +28,16 @@ import org.apache.flink.connector.jdbc.core.datastream.sink.committer.TestingCom
 import org.apache.flink.connector.jdbc.datasource.connections.JdbcConnectionProvider;
 import org.apache.flink.connector.jdbc.datasource.connections.xa.SimpleXaConnectionProvider;
 import org.apache.flink.connector.jdbc.datasource.connections.xa.XaConnectionProvider;
+import org.apache.flink.connector.jdbc.datasource.transactions.xa.XaTransaction;
 import org.apache.flink.connector.jdbc.datasource.transactions.xa.domain.TransactionId;
 import org.apache.flink.connector.jdbc.testutils.tables.templates.BooksTable;
+import org.apache.flink.testutils.logging.LoggerAuditingExtension;
 import org.apache.flink.util.FlinkRuntimeException;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.slf4j.event.Level;
 
 import javax.transaction.xa.Xid;
 
@@ -51,6 +55,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Smoke tests for the {@link JdbcWriter} with ExactlyOnce semantics and the underlying classes. */
 class ExactlyOnceJdbcWriterTest extends BaseJdbcWriterTest {
+
+    @RegisterExtension
+    final LoggerAuditingExtension writerLog =
+            new LoggerAuditingExtension(JdbcWriter.class, Level.WARN);
+
+    @RegisterExtension
+    final LoggerAuditingExtension transactionLog =
+            new LoggerAuditingExtension(XaTransaction.class, Level.WARN);
 
     @Override
     protected JdbcExecutionOptions getExecutionOptions() {
@@ -255,6 +267,17 @@ class ExactlyOnceJdbcWriterTest extends BaseJdbcWriterTest {
 
         assertThat(recover()).isEmpty();
         assertThat(TEST_TABLE.selectAllTable(getMetadata())).isEqualTo(BOOKS.subList(0, 2));
+    }
+
+    /** A writer that finds nothing left behind has nothing to warn about. */
+    @Test
+    void testNoWarningWithoutLeftovers() throws Exception {
+        sinkWriter.close();
+
+        sinkWriter = newWriter(new JobID(), 0, 1, OptionalLong.empty(), Collections.emptyList());
+
+        assertThat(writerLog.getMessages()).isEmpty();
+        assertThat(transactionLog.getMessages()).isEmpty();
     }
 
     /** Commits the committable the way the committer gets it when it is not chained. */

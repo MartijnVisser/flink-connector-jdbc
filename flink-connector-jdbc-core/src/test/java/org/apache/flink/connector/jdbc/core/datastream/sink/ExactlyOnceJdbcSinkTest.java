@@ -73,18 +73,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ExactlyOnceJdbcSinkTest extends BaseJdbcSinkTest {
 
     /** The books table without its key, so that a record written twice shows up twice. */
-    private static final TableRow RECOVERY_TABLE =
-            tableRow(
-                    "RecoverySinkTable",
-                    field("id", INT().notNull()),
-                    field("title", VARCHAR(50)),
-                    field("author", VARCHAR(50)),
-                    field("price", dbType("FLOAT"), DOUBLE()),
-                    field("qty", INT()));
+    protected static final TableRow RECOVERY_TABLE = recoveryTable("RecoverySinkTable");
 
-    private static final long RECOVERY_RECORDS = 100;
+    protected static final long RECOVERY_RECORDS = 100;
 
-    private static final long CHECKPOINT_TIMEOUT = 300L;
+    protected static final long CHECKPOINT_TIMEOUT = 300L;
 
     private static final long RESCALE_RECORDS = 1_000;
 
@@ -93,7 +86,7 @@ class ExactlyOnceJdbcSinkTest extends BaseJdbcSinkTest {
     private static final int UPDATES = 10_000;
 
     @RegisterExtension
-    private final SharedObjectsExtension sharedObjects = SharedObjectsExtension.create();
+    protected final SharedObjectsExtension sharedObjects = SharedObjectsExtension.create();
 
     @Override
     protected <T> JdbcSink<T> finishSink(JdbcSinkBuilder<T> builder) {
@@ -245,34 +238,53 @@ class ExactlyOnceJdbcSinkTest extends BaseJdbcSinkTest {
         }
     }
 
-    private JdbcSink<BooksTable.BookEntry> recoverySink() {
-        return finishSink(
-                new JdbcSinkBuilder<BooksTable.BookEntry>()
-                        .withQueryStatement(
-                                RECOVERY_TABLE.getInsertIntoQuery(),
-                                (ps, book) -> {
-                                    ps.setInt(1, book.id);
-                                    ps.setString(2, book.title);
-                                    ps.setString(3, book.author);
-                                    ps.setDouble(4, book.price);
-                                    ps.setInt(5, book.qty);
-                                }));
+    protected static TableRow recoveryTable(String name) {
+        return tableRow(
+                name,
+                field("id", INT().notNull()),
+                field("title", VARCHAR(50)),
+                field("author", VARCHAR(50)),
+                field("price", dbType("FLOAT"), DOUBLE()),
+                field("qty", INT()));
+    }
+
+    protected JdbcSink<BooksTable.BookEntry> recoverySink() {
+        return finishSink(recoverySinkBuilder(RECOVERY_TABLE));
+    }
+
+    protected static JdbcSinkBuilder<BooksTable.BookEntry> recoverySinkBuilder(TableRow table) {
+        return new JdbcSinkBuilder<BooksTable.BookEntry>()
+                .withQueryStatement(
+                        table.getInsertIntoQuery(),
+                        (ps, book) -> {
+                            ps.setInt(1, book.id);
+                            ps.setString(2, book.title);
+                            ps.setString(3, book.author);
+                            ps.setDouble(4, book.price);
+                            ps.setInt(5, book.qty);
+                        });
     }
 
     /** Checks for prepared transactions first, as a select would wait for their locks. */
-    private void assertWrittenOnce(long records) throws SQLException {
+    protected void assertWrittenOnce(long records) throws SQLException {
+        assertNothingPrepared();
+        assertThat(written(RECOVERY_TABLE))
+                .containsExactlyInAnyOrderElementsOf(
+                        IntStream.range(0, (int) records).boxed().collect(Collectors.toList()));
+    }
+
+    protected void assertNothingPrepared() throws SQLException {
         try (SimpleXaConnectionProvider xa =
                 SimpleXaConnectionProvider.from(getMetadata().buildXaDataSource())) {
             xa.open();
             assertThat(xa.recover()).isEmpty();
         }
-        List<Integer> written =
-                RECOVERY_TABLE.selectAllTable(getMetadata()).stream()
-                        .map(row -> (Integer) row.getField(0))
-                        .collect(Collectors.toList());
-        assertThat(written)
-                .containsExactlyInAnyOrderElementsOf(
-                        IntStream.range(0, (int) records).boxed().collect(Collectors.toList()));
+    }
+
+    protected List<Integer> written(TableRow table) throws SQLException {
+        return table.selectAllTable(getMetadata()).stream()
+                .map(row -> (Integer) row.getField(0))
+                .collect(Collectors.toList());
     }
 
     /**
@@ -317,7 +329,7 @@ class ExactlyOnceJdbcSinkTest extends BaseJdbcSinkTest {
         }
     }
 
-    private static BooksTable.BookEntry book(Long id) {
+    protected static BooksTable.BookEntry book(Long id) {
         return new BooksTable.BookEntry(id.intValue(), "Book " + id, "Writer", id.doubleValue(), 1);
     }
 
@@ -326,7 +338,7 @@ class ExactlyOnceJdbcSinkTest extends BaseJdbcSinkTest {
      * the checkpoint timeout and fails the last one. A chain takes its snapshots from the tail to
      * the head, so the sink has already prepared its transaction for those checkpoints.
      */
-    private static class FailingSnapshotMapper
+    protected static class FailingSnapshotMapper
             implements MapFunction<BooksTable.BookEntry, BooksTable.BookEntry>,
                     CheckpointedFunction {
 

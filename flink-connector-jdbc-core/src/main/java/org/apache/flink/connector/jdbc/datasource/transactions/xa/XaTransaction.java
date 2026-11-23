@@ -132,18 +132,19 @@ public class XaTransaction implements Serializable, AutoCloseable {
     }
 
     /**
-     * Keeps only the hanging transactions of this job, which {@link #open} rolls back. Those of
-     * another job may belong to a job that still runs and is about to commit them, for example the
+     * Keeps only the hanging transactions that this writer owns, see {@link #owns}, which {@link
+     * #open} rolls back without listing the prepared transactions. The others belong to another
+     * writer, or may belong to a job that still runs and is about to commit them, for example the
      * job that took the savepoint this one restores.
      */
     public void recoverState(JdbcWriterState state) {
         hangingXids = new LinkedList<>();
         for (TransactionId hanging : state.getHanging()) {
-            if (Arrays.equals(hanging.getJobId(), baseTransaction.getJobId())) {
+            if (owns(hanging, true)) {
                 hangingXids.add(hanging);
             } else {
                 LOG.info(
-                        "leaving the restored transaction of another job, xid={}",
+                        "leaving a restored transaction that another job or subtask owns, xid={}",
                         hanging.getXidValue());
             }
         }
@@ -162,10 +163,9 @@ public class XaTransaction implements Serializable, AutoCloseable {
     }
 
     /**
-     * Rolls back the prepared transactions of this writer from the given checkpoint on. A failed
-     * attempt may have left them prepared, the restart replays their records, and the committer
-     * only commits transactions of earlier checkpoints. It runs whether or not {@code
-     * discoverAndRollbackOnRecovery} is set, and fails if it can't list them.
+     * Rolls back the prepared transactions left behind from the given checkpoint on. Their records
+     * are replayed, and the committer only commits transactions of earlier checkpoints. It fails if
+     * it can't list them.
      */
     public void rollbackPreparedTxs(long checkpointId) {
         Collection<Xid> recovered;
@@ -176,42 +176,125 @@ public class XaTransaction implements Serializable, AutoCloseable {
             // from a later checkpoint start past it
             throw new FlinkRuntimeException(
                     String.format(
-                            "unable to list the prepared transactions to roll back those that a"
-                                    + " failed attempt prepared for checkpoint %d or later (on"
-                                    + " MySQL, grant XA_RECOVER_ADMIN)",
+                            "unable to list the prepared transactions to roll back those left"
+                                    + " behind from checkpoint %d on (on MySQL, grant"
+                                    + " XA_RECOVER_ADMIN)",
                             checkpointId),
                     e);
         }
+        List<TransactionId> leftAlone = new ArrayList<>();
         for (Xid xid : recovered) {
-            if (isOwnFromCheckpoint(xid, checkpointId)) {
-                LOG.info("rolling back transaction of a failed attempt, xid={}", xid);
-                xaConnectionProvider.rollback(xid);
+            Optional<TransactionId> transactionId = parse(xid);
+            if (!transactionId.isPresent()) {
+                continue;
             }
+            if (!owns(transactionId.get(), false)) {
+                if (isOfOtherJobWithoutPrefix(transactionId.get())
+                        && transactionId.get().getCheckpointId() >= checkpointId) {
+                    leftAlone.add(transactionId.get());
+                }
+            } else if (transactionId.get().getCheckpointId() >= checkpointId) {
+                LOG.info("rolling back a leftover transaction, xid={}", xid);
+                rollback(xid);
+            }
+        }
+        if (!leftAlone.isEmpty() && baseTransaction.getSubtaskId() == 0) {
+            LOG.warn(
+                    "left {} prepared transactions alone that have no transaction id prefix and are"
+                            + " of another job or parallelism, as their job or sink may still use"
+                            + " them. If not, they keep their locks until they are rolled back by"
+                            + " hand.{} {}",
+                    leftAlone.size(),
+                    baseTransaction.getPrefixBytes() == null
+                            ? " Set a prefix with"
+                                    + " JdbcExactlyOnceOptions.builder().withTransactionIdPrefix(\"my-sink\")"
+                                    + " to roll back those of earlier jobs."
+                            : "",
+                    leftAlone);
+        }
+    }
+
+    private void rollback(Xid xid) {
+        try {
+            xaConnectionProvider.rollback(xid);
+        } catch (RuntimeException e) {
+            boolean prepared;
+            try {
+                prepared = isPrepared(xid);
+            } catch (RuntimeException listingFailure) {
+                e.addSuppressed(listingFailure);
+                throw e;
+            }
+            if (prepared) {
+                throw e;
+            }
+            LOG.info("leftover transaction is gone already, xid={}", xid);
+        }
+    }
+
+    private static Optional<TransactionId> parse(Xid xid) {
+        try {
+            return Optional.of(
+                    TransactionId.createFromXid(
+                            xid.getFormatId(),
+                            xid.getGlobalTransactionId(),
+                            xid.getBranchQualifier()));
+        } catch (IOException e) {
+            // not written by this sink
+            return Optional.empty();
         }
     }
 
     /**
-     * A transaction id names the job, the subtask and the parallelism, but not the sink. Another
-     * exactly-once sink of the job at the same parallelism can't run, as it starts the same xids.
-     * At another parallelism its xids differ only in the parallelism, so that has to match too.
+     * Whether this writer rolls back the given transaction that a failed attempt or an earlier job
+     * left behind. A transaction id names the job, the subtask and the parallelism, and the prefix
+     * if there is one.
+     *
+     * <p>Transactions under a prefix belong to the writers with that prefix, each to the one whose
+     * subtask index is its own modulo the parallelism. So each has a single owner, also those of
+     * earlier jobs and of another parallelism, as long as all writers can list them.
+     *
+     * <p>Transactions without a prefix belong to the writers of their job, with or without a
+     * prefix, so a job that adds one still rolls back what its failed attempt left behind. Those of
+     * another job may belong to a job that still runs. A restored hanging transaction belongs to
+     * the writer that restores it, as each restored state goes to a single writer. A listed one
+     * only to the writer of its subtask and parallelism: another exactly-once sink of the job may
+     * write at another parallelism, and in BATCH the other writers may have prepared theirs for the
+     * committer already.
      */
-    private boolean isOwnFromCheckpoint(Xid xid, long checkpointId) {
-        if (xid.getFormatId() != baseTransaction.getFormatId()
-                || !Arrays.equals(
-                        xid.getGlobalTransactionId(), baseTransaction.getGlobalTransactionId())) {
-            return false;
+    private boolean owns(TransactionId transactionId, boolean restoredHanging) {
+        byte[] prefix = transactionId.getPrefixBytes();
+        if (prefix != null) {
+            return Arrays.equals(prefix, baseTransaction.getPrefixBytes())
+                    && transactionId.getSubtaskId() % baseTransaction.getNumberOfSubtasks()
+                            == baseTransaction.getSubtaskId();
         }
-        try {
-            TransactionId transactionId =
-                    TransactionId.createFromXid(
-                            xid.getFormatId(),
-                            xid.getGlobalTransactionId(),
-                            xid.getBranchQualifier());
-            return transactionId.getNumberOfSubtasks() == baseTransaction.getNumberOfSubtasks()
-                    && transactionId.getCheckpointId() >= checkpointId;
-        } catch (IOException e) {
-            return false;
-        }
+        return Arrays.equals(transactionId.getJobId(), baseTransaction.getJobId())
+                && (restoredHanging
+                        || (transactionId.getSubtaskId() == baseTransaction.getSubtaskId()
+                                && transactionId.getNumberOfSubtasks()
+                                        == baseTransaction.getNumberOfSubtasks()));
+    }
+
+    /** A leftover that nothing rolls back if its job is gone. */
+    private boolean isOfOtherJobWithoutPrefix(TransactionId transactionId) {
+        return transactionId.getPrefixBytes() == null
+                && (!Arrays.equals(transactionId.getJobId(), baseTransaction.getJobId())
+                        || transactionId.getNumberOfSubtasks()
+                                != baseTransaction.getNumberOfSubtasks());
+    }
+
+    private boolean isPrepared(Xid xid) {
+        return xaConnectionProvider.recover().stream()
+                .anyMatch(
+                        recovered ->
+                                recovered.getFormatId() == xid.getFormatId()
+                                        && Arrays.equals(
+                                                recovered.getGlobalTransactionId(),
+                                                xid.getGlobalTransactionId())
+                                        && Arrays.equals(
+                                                recovered.getBranchQualifier(),
+                                                xid.getBranchQualifier()));
     }
 
     /**
