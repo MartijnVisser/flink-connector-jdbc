@@ -192,9 +192,12 @@ public class SimpleXaConnectionProvider implements XaConnectionProvider {
                         },
                         err -> {
                             if (err.errorCode >= XAException.XA_RBBASE) {
-                                rollback(xid);
+                                // the database may have rolled it back and forgotten it already
+                                rollbackIfKnown(xid);
                             } else {
                                 LOG.warn(formatErrorMessage("end (fail)", xid, err.errorCode));
+                                // a prepared transaction can't be ended, only rolled back
+                                rollbackIfKnown(xid);
                             }
                         }));
     }
@@ -220,6 +223,25 @@ public class SimpleXaConnectionProvider implements XaConnectionProvider {
                         xid,
                         () -> xaResource.rollback(xid),
                         this::buildRollbackErrorDesc));
+    }
+
+    private void rollbackIfKnown(Xid xid) {
+        try {
+            xaResource.rollback(xid);
+        } catch (XAException e) {
+            if (e.errorCode == XAException.XAER_NOTA) {
+                return;
+            }
+            if (XaError.isHeurErrorCode(e.errorCode)) {
+                // as rollback() does, since the database reports it until it is forgotten
+                forget(xid);
+            }
+            Optional<String> rolledBack = buildRollbackErrorDesc(e);
+            if (!rolledBack.isPresent()) {
+                throw wrapException("rollback", xid, e);
+            }
+            LOG.warn(formatErrorMessage("rollback", xid, e.errorCode, rolledBack.get()));
+        }
     }
 
     private void forget(Xid xid) {
